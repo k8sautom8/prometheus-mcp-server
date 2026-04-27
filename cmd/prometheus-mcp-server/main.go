@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 
 	"github.com/joho/godotenv"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -63,10 +64,26 @@ func main() {
 	}
 }
 
-// healthPassthrough returns 200 for GET / without an MCP session so Docker healthchecks succeed.
+// healthPassthrough returns 200 for simple GETs without an MCP session so health checks and
+// manual probes (e.g. curl host:8052/ or :8052/mcp) work. The streamable MCP handler requires
+// Mcp-Session-Id and JSON-RPC for real traffic; use an MCP HTTP client for that.
 func healthPassthrough(inner http.Handler) http.Handler {
+	healthPaths := map[string]struct{}{
+		"/":        {},
+		"/mcp":     {},
+		"/health":  {},
+		"/healthz": {},
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/" && r.Header.Get("Mcp-Session-Id") == "" {
+		if r.Method != http.MethodGet || r.Header.Get("Mcp-Session-Id") != "" {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		p := path.Clean(r.URL.Path)
+		if p == "." {
+			p = "/"
+		}
+		if _, ok := healthPaths[p]; ok {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
