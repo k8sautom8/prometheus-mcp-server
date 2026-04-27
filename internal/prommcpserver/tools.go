@@ -102,6 +102,8 @@ func (d *Deps) RegisterTools(s *mcp.Server) {
 		Title:       "Get Scrape Targets",
 		Annotations: toolAnnotations("Get Scrape Targets"),
 	}, d.getTargets)
+
+	d.registerExtendedTools(s)
 }
 
 type healthCheckIn struct{}
@@ -116,6 +118,7 @@ func (d *Deps) healthCheck(ctx context.Context, req *mcp.CallToolRequest, _ heal
 		"transport": d.Cfg.MCPTransport,
 		"configuration": map[string]any{
 			"prometheus_url_configured": d.Cfg.PrometheusURL != "",
+			"metrics_url_env":           d.Cfg.MetricsURLSource,
 			"authentication_configured": (d.Cfg.Username != "" && d.Cfg.Password != "") || d.Cfg.Token != "" || d.Cfg.ClientCertPath != "",
 			"org_id_configured":         d.Cfg.OrgID != "",
 		},

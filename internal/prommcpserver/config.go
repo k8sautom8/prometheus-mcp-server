@@ -10,22 +10,29 @@ import (
 
 // Config holds runtime configuration loaded from the environment.
 type Config struct {
-	PrometheusURL            string
-	URLSSLVerify             bool
-	DisablePrometheusLinks   bool
-	Username                 string
-	Password                 string
-	Token                    string
-	OrgID                    string
-	ClientCertPath           string
-	ClientKeyPath            string
-	CustomHeaders            map[string]string
-	RequestTimeoutSec        int
-	ToolPrefix               string
-	RequestsCABundle         string
-	MCPTransport             string
-	MCPBindHost              string
-	MCPBindPort              int
+	PrometheusURL string
+	// MetricsURLSource records which env var populated PrometheusURL (PROMETHEUS_URL, VICTORIAMETRICS_URL, or VM_SELECT_URL).
+	MetricsURLSource       string
+	URLSSLVerify           bool
+	DisablePrometheusLinks bool
+	Username               string
+	Password               string
+	Token                  string
+	OrgID                  string
+	ClientCertPath         string
+	ClientKeyPath          string
+	CustomHeaders          map[string]string
+	RequestTimeoutSec      int
+	ToolPrefix             string
+	RequestsCABundle       string
+	MCPTransport           string
+	MCPBindHost            string
+	MCPBindPort            int
+	// VMAlertURL is the base URL for vmalert's /api/v1/rules and /api/v1/alerts when not served under the Prometheus prefix.
+	// If empty and PrometheusURL contains "/select/", the client defaults to {PrometheusURL}/vmalert (VictoriaMetrics cluster layout).
+	VMAlertURL string
+	// ExportMaxBytes caps /api/v1/export and similar raw responses (default 2MiB).
+	ExportMaxBytes int64
 }
 
 func parseBoolEnv(key string, defaultVal bool) bool {
@@ -71,8 +78,23 @@ func LoadConfig() (*Config, error) {
 		port = n
 	}
 
+	promURL := strings.TrimSpace(os.Getenv("PROMETHEUS_URL"))
+	urlSource := "PROMETHEUS_URL"
+	if promURL == "" {
+		promURL = strings.TrimSpace(os.Getenv("VICTORIAMETRICS_URL"))
+		urlSource = "VICTORIAMETRICS_URL"
+	}
+	if promURL == "" {
+		promURL = strings.TrimSpace(os.Getenv("VM_SELECT_URL"))
+		urlSource = "VM_SELECT_URL"
+	}
+	if promURL == "" {
+		urlSource = ""
+	}
+
 	cfg := &Config{
-		PrometheusURL:          strings.TrimSpace(os.Getenv("PROMETHEUS_URL")),
+		PrometheusURL:          promURL,
+		MetricsURLSource:       urlSource,
 		URLSSLVerify:           parseBoolEnv("PROMETHEUS_URL_SSL_VERIFY", true),
 		DisablePrometheusLinks: parseBoolEnv("PROMETHEUS_DISABLE_LINKS", false),
 		Username:               os.Getenv("PROMETHEUS_USERNAME"),
@@ -97,13 +119,28 @@ func LoadConfig() (*Config, error) {
 		cfg.MCPBindHost = "127.0.0.1"
 	}
 
+	exportMax := int64(2097152)
+	if v := strings.TrimSpace(os.Getenv("PROMETHEUS_EXPORT_MAX_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("PROMETHEUS_EXPORT_MAX_BYTES: %w", err)
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("PROMETHEUS_EXPORT_MAX_BYTES must be positive")
+		}
+		exportMax = n
+	}
+
+	cfg.VMAlertURL = strings.TrimSpace(os.Getenv("VMALERT_URL"))
+	cfg.ExportMaxBytes = exportMax
+
 	return cfg, nil
 }
 
 // Validate checks required fields and transport settings before serving.
 func (c *Config) Validate() error {
 	if c.PrometheusURL == "" {
-		return fmt.Errorf("PROMETHEUS_URL is not set")
+		return fmt.Errorf("set PROMETHEUS_URL or VICTORIAMETRICS_URL (VictoriaMetrics vmselect Prometheus API base URL)")
 	}
 	switch c.MCPTransport {
 	case "stdio", "http", "sse":
@@ -128,6 +165,28 @@ func (c *Config) ServerName() string {
 func (c *Config) ToolName(base string) string {
 	if c.ToolPrefix != "" {
 		return c.ToolPrefix + "_" + base
+	}
+	return base
+}
+
+// AdminBaseFromMetricsURL returns the vmselect (or single-node) host root used for /flags and similar endpoints.
+// For URLs like http://vm:8481/select/0/prometheus it returns http://vm:8481.
+func AdminBaseFromMetricsURL(metricsBase string) string {
+	metricsBase = strings.TrimRight(metricsBase, "/")
+	if i := strings.Index(metricsBase, "/select/"); i >= 0 {
+		return metricsBase[:i]
+	}
+	return metricsBase
+}
+
+// VMAlertAPIPrefix returns the base path for vmalert HTTP API (/api/v1/rules, /api/v1/alerts).
+func (c *Config) VMAlertAPIPrefix() string {
+	if v := strings.TrimSpace(c.VMAlertURL); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	base := strings.TrimRight(c.PrometheusURL, "/")
+	if strings.Contains(base, "/select/") {
+		return base + "/vmalert"
 	}
 	return base
 }

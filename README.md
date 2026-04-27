@@ -7,9 +7,11 @@
 ![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)
 [![License](https://img.shields.io/github/license/pab1it0/prometheus-mcp-server)](https://github.com/pab1it0/prometheus-mcp-server/blob/main/LICENSE)
 
-Give AI assistants the power to query your Prometheus metrics.
+Give AI assistants the power to query metrics over a **Prometheus-compatible HTTP API**—including **[VictoriaMetrics][vm] open source** on-premises (typically `vmselect` URLs such as `http://vmselect:8481/select/0/prometheus`) and plain Prometheus.
 
-A [Model Context Protocol][mcp] (MCP) server that provides access to your Prometheus metrics and queries through standardized MCP interfaces, allowing AI assistants to execute PromQL queries and analyze your metrics data.
+A [Model Context Protocol][mcp] (MCP) server that exposes that API to MCP clients so assistants can run PromQL/MetricsQL queries (VictoriaMetrics accepts both), list metrics, read metadata, and inspect targets where the backend exposes them.
+
+[vm]: https://docs.victoriametrics.com/
 
 [mcp]: https://modelcontextprotocol.io
 
@@ -17,7 +19,7 @@ A [Model Context Protocol][mcp] (MCP) server that provides access to your Promet
 
 ### Prerequisites
 
-- Prometheus server accessible from your environment
+- A reachable **Prometheus-compatible** query endpoint (Prometheus, or VictoriaMetrics `vmselect` with the `/select/.../prometheus` path your deployment uses)
 - MCP-compatible client (Claude Desktop, VS Code, Cursor, Windsurf, etc.)
 
 ### Installation Methods
@@ -160,7 +162,9 @@ See the [chart values](charts/prometheus-mcp-server/values.yaml) for all availab
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `PROMETHEUS_URL` | URL of your Prometheus server | Yes |
+| `PROMETHEUS_URL` | Base URL for the Prometheus HTTP API (`/api/v1/...`). Use this **or** one of the VictoriaMetrics variables below | One of URL vars |
+| `VICTORIAMETRICS_URL` | Same as `PROMETHEUS_URL` for VictoriaMetrics on-prem (e.g. vmselect `http://host:8481/select/0/prometheus`). Ignored if `PROMETHEUS_URL` is set | One of URL vars |
+| `VM_SELECT_URL` | Third alias used only if both above are empty | One of URL vars |
 | `PROMETHEUS_URL_SSL_VERIFY` | Set to False to disable SSL verification | No |
 | `PROMETHEUS_DISABLE_LINKS` | Set to True to disable Prometheus UI links in query results (saves context tokens) | No |
 | `PROMETHEUS_REQUEST_TIMEOUT` | Request timeout in seconds to prevent hanging requests (DDoS protection) | No (default: 30) |
@@ -170,7 +174,9 @@ See the [chart values](charts/prometheus-mcp-server/values.yaml) for all availab
 | `PROMETHEUS_CLIENT_CERT` | Path to client certificate file for mutual TLS authentication | No |
 | `PROMETHEUS_CLIENT_KEY` | Path to client private key file for mutual TLS authentication | No |
 | `REQUESTS_CA_BUNDLE` | Path to CA bundle file for verifying the server's TLS certificate (standard `requests` library env var) | No |
-| `ORG_ID` | Organization ID for multi-tenant setups | No |
+| `ORG_ID` | Sent as `X-Scope-OrgID` (VictoriaMetrics cluster multi-tenancy, or other proxies that expect it) | No |
+| `VMALERT_URL` | Base URL for vmalert when rules/alerts are not under `{PROMETHEUS_URL}/vmalert` (cluster default adds `/vmalert` under `/select/.../prometheus` automatically) | No |
+| `PROMETHEUS_EXPORT_MAX_BYTES` | Max bytes read for `/api/v1/export` responses (default 2097152) | No |
 | `PROMETHEUS_MCP_SERVER_TRANSPORT` | Transport mode (stdio, http, sse) | No (default: stdio) |
 | `PROMETHEUS_MCP_BIND_HOST` | Host for HTTP transport | No (default: 127.0.0.1) |
 | `PROMETHEUS_MCP_BIND_PORT` | Port for HTTP transport | No (default: 8052) |
@@ -179,20 +185,174 @@ See the [chart values](charts/prometheus-mcp-server/values.yaml) for all availab
 
 ## Available Tools
 
+Core tools match the original Prometheus MCP server. Additional tools mirror **[VictoriaMetrics mcp-victoriametrics](https://github.com/VictoriaMetrics/mcp-victoriametrics)** where the backend exposes the same HTTP paths (open source / on‑prem). **Not included:** VictoriaMetrics Cloud-only tools (`tenants`, `deployments`, `access_tokens`, …) and in-process **`test_rules`** (vmalert-tool); use `vmalert-tool` locally if you need that.
+
 | Tool | Category | Description |
 | --- | --- | --- |
-| `health_check` | System | Health check endpoint for container monitoring and status verification |
-| `execute_query` | Query | Execute a PromQL instant query against Prometheus |
-| `execute_range_query` | Query | Execute a PromQL range query with start time, end time, and step interval |
-| `list_metrics` | Discovery | List all available metrics in Prometheus with pagination and filtering support |
-| `get_metric_metadata` | Discovery | Get metadata for one metric or bulk metadata with optional filtering |
-| `get_targets` | Discovery | Get information about all scrape targets |
+| `health_check` | System | Health check and connectivity probe |
+| `execute_query` | Query | Instant query |
+| `execute_range_query` | Query | Range query |
+| `list_metrics` | Discovery | Metric names (cached helper over `__name__` values) |
+| `get_metric_metadata` | Discovery | `/api/v1/metadata` |
+| `get_targets` | Discovery | `/api/v1/targets` |
+| `series` | Discovery | `/api/v1/series` |
+| `labels` | Discovery | `/api/v1/labels` |
+| `label_values` | Discovery | `/api/v1/label/{name}/values` |
+| `metrics` | Discovery | `__name__` values with match/start/end/limit (VM-style) |
+| `rules` | Alerting | `/api/v1/rules` (tries vmalert prefix first, then Prometheus URL) |
+| `alerts` | Alerting | `/api/v1/alerts` with optional state/group/limit/offset filtering |
+| `export` | Data | `/api/v1/export` or `/api/v1/export/csv` (raw body, size-capped) |
+| `tsdb_status` | Ops | `/api/v1/status/tsdb` |
+| `top_queries` | Ops | `/api/v1/status/top_queries` |
+| `metric_statistics` | Ops | `/api/v1/status/metric_names_stats` (VictoriaMetrics) |
+| `active_queries` | Ops | `/api/v1/status/active_queries` |
+| `get_build_info` | Ops | `/api/v1/status/buildinfo` |
+| `get_runtime_info` | Ops | `/api/v1/status/runtimeinfo` |
+| `get_config_yaml` | Ops | `/api/v1/status/config` |
+| `get_flags` | Ops | `/api/v1/status/flags`, or vmselect `/flags` text fallback |
+| `prettify_query` | Query helpers | `metricsql` library or `prettify-query` HTTP |
+| `explain_query` | Query helpers | Parse via `metricsql` + canonical form |
+| `documentation` | Docs | Links to MetricsQL / Prometheus API docs |
+| `metric_relabel_debug` | Debug | `/metric-relabel-debug` (VictoriaMetrics) |
+| `retention_filters_debug` | Debug | `/retention-filters-debug` |
+| `downsampling_filters_debug` | Debug | `/downsampling-filters-debug` |
 
-The list of tools is configurable, so you can choose which tools you want to make available to the MCP client. This is useful if you don't use certain functionality or if you don't want to take up too much of the context window.
+Some endpoints are VictoriaMetrics-specific or Enterprise-only; callers may receive HTTP errors on plain Prometheus.
+
+Use a `TOOL_PREFIX` if you run multiple MCP server instances and need unique tool names per environment.
+
+### Example prompts (plain English)
+
+In Cursor, Claude Desktop, or any MCP client, you describe intent in natural language; the assistant picks tools and fills arguments. Examples:
+
+| You might say | Tools the assistant will often use |
+| --- | --- |
+| “Is Prometheus / VictoriaMetrics reachable and can you run a simple query?” | `health_check`, maybe `execute_query` with `up` |
+| “What’s the current value of `process_resident_memory_bytes` for `job="api"`?” | `execute_query` (instant PromQL/MetricsQL) |
+| “Plot request rate over the last 24 hours with a 5-minute step.” | `execute_range_query` with `query`, `start`, `end`, `step` |
+| “List metrics whose names look like `http`.” | `list_metrics` with `filter_pattern`, or `metrics` / `label_values` on `__name__` |
+| “What label names exist for series matching `{job="node"}`?” | `labels` with optional `match` |
+| “What are the values of the `instance` label for `up`?” | `label_values` with `label_name`: `instance`, `match`: `up` |
+| “Show me series that match `{__name__=~"container_.*"}`.” | `series` with `match` (and optional `start` / `end` / `limit`) |
+| “What metadata do we have for `node_cpu_seconds_total`?” | `get_metric_metadata` |
+| “Which scrape targets are up or down?” | `get_targets`, often plus `execute_query` on `up` |
+| “What rules and alerts are defined? Anything firing?” | `rules`, `alerts` (e.g. filter `state`: `firing`) |
+| “How heavy is cardinality / what dominates TSDB?” | `tsdb_status` (VictoriaMetrics / newer Prometheus) |
+| “What queries are slow or most frequent?” | `top_queries`, `active_queries`, `metric_statistics` (where supported) |
+| “Pretty-print this query: `sum(rate(http_requests_total[5m])) by (job)`” | `prettify_query`, sometimes `explain_query` |
+| “Give me doc links for MetricsQL vs Prometheus HTTP API.” | `documentation` |
+| “Export raw samples for `{job="prometheus"}` as JSON lines.” | `export` with `match`, `format`: `json` or `csv` |
+
+If you set `TOOL_PREFIX`, the same flows apply but tool names become e.g. `prod_execute_query` instead of `execute_query`.
+
+### Example tool arguments (reference)
+
+Illustrative JSON for `tools/call` / debugging; your client normally builds this from chat.
+
+**Instant query**
+
+```json
+{
+  "name": "execute_query",
+  "arguments": {
+    "query": "sum(rate(http_requests_total[5m])) by (job)"
+  }
+}
+```
+
+**Range query**
+
+```json
+{
+  "name": "execute_range_query",
+  "arguments": {
+    "query": "up",
+    "start": "2025-04-26T00:00:00Z",
+    "end": "2025-04-27T00:00:00Z",
+    "step": "5m"
+  }
+}
+```
+
+**Series and labels**
+
+```json
+{
+  "name": "series",
+  "arguments": {
+    "match": "{job=\"prometheus\"}",
+    "limit": 100
+  }
+}
+```
+
+```json
+{
+  "name": "label_values",
+  "arguments": {
+    "label_name": "instance",
+    "match": "up"
+  }
+}
+```
+
+**Alerts and rules**
+
+```json
+{
+  "name": "alerts",
+  "arguments": {
+    "state": "firing",
+    "limit": 50
+  }
+}
+```
+
+```json
+{
+  "name": "rules",
+  "arguments": {
+    "type": "alert"
+  }
+}
+```
+
+**Operations (VictoriaMetrics-friendly)**
+
+```json
+{
+  "name": "tsdb_status",
+  "arguments": {
+    "topN": 15,
+    "focusLabel": "__name__"
+  }
+}
+```
+
+```json
+{
+  "name": "top_queries",
+  "arguments": {
+    "topN": 10,
+    "maxLifetime": "10m"
+  }
+}
+```
+
+**Query helpers**
+
+```json
+{
+  "name": "prettify_query",
+  "arguments": {
+    "query": "sum(rate(foo[5m]))by(job)"
+  }
+}
+```
 
 ## Features
 
-- Execute PromQL queries against Prometheus
+- Execute queries against any Prometheus-compatible `/api/v1` implementation (Prometheus or VictoriaMetrics OSS)
 - Discover and explore metrics
   - List available metrics
   - Get metadata for specific metrics

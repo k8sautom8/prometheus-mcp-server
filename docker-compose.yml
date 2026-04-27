@@ -1,6 +1,6 @@
 # Prometheus MCP Server — Docker Compose
 #
-# Point at your Prometheus (set PROMETHEUS_URL in .env or override below):
+# Point at Prometheus or VictoriaMetrics vmselect (PROMETHEUS_URL or VICTORIAMETRICS_URL in .env):
 #   cp .env.template .env
 #   docker compose up --build
 #
@@ -22,7 +22,8 @@ services:
       - "${PROMETHEUS_MCP_PORT:-8052}:${PROMETHEUS_MCP_BIND_PORT:-8052}"
 
     environment:
-      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://vm.london.local}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-}
+      VICTORIAMETRICS_URL: ${VICTORIAMETRICS_URL:-http://vm.london.local}
       PROMETHEUS_MCP_SERVER_TRANSPORT: ${PROMETHEUS_MCP_SERVER_TRANSPORT:-http}
       PROMETHEUS_MCP_BIND_HOST: "0.0.0.0"
       PROMETHEUS_MCP_BIND_PORT: ${PROMETHEUS_MCP_BIND_PORT:-8052}
