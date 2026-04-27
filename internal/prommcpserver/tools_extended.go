@@ -81,6 +81,8 @@ func (d *Deps) registerExtendedTools(s *mcp.Server) {
 	reg("metric_relabel_debug", "Debug metric relabel rules", "GET .../metric-relabel-debug (VictoriaMetrics).", d.metricRelabelDebug)
 	reg("retention_filters_debug", "Debug retention filters", "GET .../retention-filters-debug (Enterprise/OSS where exposed).", d.retentionFiltersDebug)
 	reg("downsampling_filters_debug", "Debug downsampling filters", "GET .../downsampling-filters-debug (Enterprise/OSS where exposed).", d.downsamplingFiltersDebug)
+
+	d.registerOperatorTools(s)
 }
 
 type seriesIn struct {

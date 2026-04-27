@@ -216,8 +216,15 @@ Core tools match the original Prometheus MCP server. Additional tools mirror **[
 | `metric_relabel_debug` | Debug | `/metric-relabel-debug` (VictoriaMetrics) |
 | `retention_filters_debug` | Debug | `/retention-filters-debug` |
 | `downsampling_filters_debug` | Debug | `/downsampling-filters-debug` |
+| `operator_host_resource_report` | Operations | **Curated runbook:** peak **CPU** / **memory** / optional **filesystem** (space + Linux inode %), **disk I/O busy %** (Linux `node_disk_*`, Windows `windows_physical_disk_*`), **network** errors/drops + Mbps (`node_network_*` / `windows_net_*`). Linux extras: **load/core**, **PSI**, **file descriptors %**, **conntrack %**, **TCP retrans/sec**, **softnet drops/sec**. Set **`include_all_standard_metrics`** to turn on every optional block for the detected profile. **K8s cluster objects** need other scrapes—see below. |
 
 Some endpoints are VictoriaMetrics-specific or Enterprise-only; callers may receive HTTP errors on plain Prometheus.
+
+**Why `operator_host_resource_report` exists:** generic `execute_query` is not enough for on-call work if nobody remembers PromQL. This tool encodes proven recipes (with `max_over_time` subqueries), discovers common agent metric families, and returns **structured breach lists** for “hosts over 80% CPU/memory in the last 3h/24h” style questions—similar in spirit to other Prometheus MCP servers that ship **SRE “golden signal” helpers** instead of only raw query passthrough.
+
+**Kubernetes + node_exporter:** metrics from the **node exporter DaemonSet** describe the **node’s Linux** (CPU, memory, disks, NICs on that VM/bare metal). They do **not** replace **kube-state-metrics** (object state: pod phase, deployment replicas, PVC bound), **cAdvisor/kubelet** (container CPU/mem throttle, OOM), or **API-server / etcd** health. Point the MCP at the same VictoriaMetrics where you already store those series, and use **`execute_query`** (or add more curated tools later) for `kube_*`, `container_*`, etc.
+
+**Possible extensions** (not all implemented): **RAID / SMART** if you export them; **predict_linear** on free space for “full in N days”; **goldilocks**-style right-sizing from container requests vs usage; NIC **utilization %** on Windows via `windows_net_current_bandwidth_bytes` in custom PromQL.
 
 Use a `TOOL_PREFIX` if you run multiple MCP server instances and need unique tool names per environment.
 
@@ -242,6 +249,8 @@ In Cursor, Claude Desktop, or any MCP client, you describe intent in natural lan
 | “Pretty-print this query: `sum(rate(http_requests_total[5m])) by (job)`” | `prettify_query`, sometimes `explain_query` |
 | “Give me doc links for MetricsQL vs Prometheus HTTP API.” | `documentation` |
 | “Export raw samples for `{job="prometheus"}` as JSON lines.” | `export` with `match`, `format`: `json` or `csv` |
+| “Which hosts hit **≥80% CPU** or **≥80% memory used** in the **last 24 hours**? Show peaks.” | `operator_host_resource_report` with `lookback`: `24h`, thresholds optional |
+| “Who pegged **disk** or had **network errors / high traffic**?” | Same tool with `include_disk_io` / `include_network`, or `include_all_standard_metrics`: true; optional `network_total_mbps_threshold` (Linux) or `windows_network_total_mbps_threshold` / `network_total_mbps_threshold` (Windows) for peak RX+TX Mbps |
 
 If you set `TOOL_PREFIX`, the same flows apply but tool names become e.g. `prod_execute_query` instead of `execute_query`.
 
@@ -349,6 +358,31 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
   }
 }
 ```
+
+**Operator breach report (node_exporter example)**
+
+```json
+{
+  "name": "operator_host_resource_report",
+  "arguments": {
+    "lookback": "24h",
+    "cpu_percent_threshold": 80,
+    "memory_percent_threshold": 80,
+    "metric_profile": "auto",
+    "label_selector": "job=\"node-exporter\"",
+    "include_filesystem": true,
+    "filesystem_used_percent_threshold": 85,
+    "include_disk_io": true,
+    "disk_percent_threshold": 80,
+    "include_network": true,
+    "network_errors_per_sec_threshold": 1,
+    "network_total_mbps_threshold": 900,
+    "include_all_standard_metrics": false
+  }
+}
+```
+
+`network_total_mbps_threshold` is optional; when set, `network_throughput_breaches` lists hosts whose **peak** combined RX+TX exceeded that value (Linux sums non-loopback interfaces; Windows sums `windows_net_*` per host). It is **not** NIC utilization % unless you add link-speed normalization in custom PromQL.
 
 ## Features
 
