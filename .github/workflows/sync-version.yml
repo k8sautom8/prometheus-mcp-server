@@ -1,0 +1,68 @@
+name: Sync Version
+
+on:
+  pull_request:
+    paths:
+      - 'internal/prommcpserver/version.go'
+  push:
+    branches:
+      - main
+    paths:
+      - 'internal/prommcpserver/version.go'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-version:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from version.go
+        id: get_version
+        run: |
+          VERSION=$(grep 'const Version' internal/prommcpserver/version.go | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Update Dockerfile
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          sed -i "s/org.opencontainers.image.version=\"[^\"]*\"/org.opencontainers.image.version=\"$VERSION\"/" Dockerfile
+          echo "Updated Dockerfile with version $VERSION"
+
+      - name: Update server.json
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          jq --arg version "$VERSION" '.version = $version' server.json > server.json.tmp
+          jq --arg version "$VERSION" '.packages[0].identifier = "ghcr.io/pab1it0/prometheus-mcp-server:" + $version' server.json.tmp > server.json.updated
+          mv server.json.updated server.json
+          rm -f server.json.tmp
+          echo "Updated server.json with version $VERSION"
+
+      - name: Update Helm chart appVersion
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" charts/prometheus-mcp-server/Chart.yaml
+          echo "Updated Chart.yaml appVersion with version $VERSION"
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          git diff --exit-code Dockerfile server.json charts/prometheus-mcp-server/Chart.yaml || echo "changes=true" >> $GITHUB_OUTPUT
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changes == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add Dockerfile server.json charts/prometheus-mcp-server/Chart.yaml
+          git commit -m "chore: sync version to ${{ steps.get_version.outputs.version }}"
+          git push

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pab1it0/prometheus-mcp-server",
+  "title": "Prometheus MCP Server",
+  "description": "MCP server providing Prometheus metrics access and PromQL query execution for AI assistants",
+  "version": "1.6.0",
+  "repository": {
+    "url": "https://github.com/pab1it0/prometheus-mcp-server",
+    "source": "github"
+  },
+  "websiteUrl": "https://pab1it0.github.io/prometheus-mcp-server",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/pab1it0/prometheus-mcp-server:1.6.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PROMETHEUS_URL",
+          "description": "Prometheus server URL (e.g., http://localhost:9090)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_URL_SSL_VERIFY",
+          "description": "Set to False to disable SSL verification",
+          "isRequired": false,
+          "format": "boolean",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_DISABLE_LINKS",
+          "description": "Set to True to disable Prometheus UI links in query results (saves context tokens in MCP clients)",
+          "isRequired": false,
+          "format": "boolean",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_USERNAME",
+          "description": "Username for Prometheus basic authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_PASSWORD",
+          "description": "Password for Prometheus basic authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "PROMETHEUS_TOKEN",
+          "description": "Bearer token for Prometheus authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "ORG_ID",
+          "description": "Organization ID for multi-tenant Prometheus setups",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_CLIENT_CERT",
+          "description": "Path to client certificate file for mutual TLS authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_CLIENT_KEY",
+          "description": "Path to client private key file for mutual TLS authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_MCP_SERVER_TRANSPORT",
+          "description": "MCP server transport type (stdio, http, or sse)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_MCP_BIND_HOST",
+          "description": "Host address for HTTP/SSE transport (default: 127.0.0.1)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_MCP_BIND_PORT",
+          "description": "Port number for HTTP/SSE transport (default: 8052)",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false
+        },
+        {
+          "name": "PROMETHEUS_CUSTOM_HEADERS",
+          "description": "Custom headers as JSON string to include in Prometheus requests",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

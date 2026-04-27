@@ -1,0 +1,32 @@
+# Prometheus MCP Server — Docker Compose
+#
+# Point at your Prometheus (set PROMETHEUS_URL in .env or override below):
+#   cp .env.template .env
+#   docker compose up --build
+#
+# Stdio mode (e.g. MCP client runs the container with -i):
+#   docker compose run --rm -i prometheus-mcp-server
+
+name: prometheus-mcp-server
+
+services:
+  prometheus-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: prometheus-mcp-server:local
+    stdin_open: true
+    tty: true
+    ports:
+      - "${PROMETHEUS_MCP_PORT:-8052}:${PROMETHEUS_MCP_BIND_PORT:-8052}"
+    environment:
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://host.docker.internal:9090}
+      PROMETHEUS_MCP_SERVER_TRANSPORT: ${PROMETHEUS_MCP_SERVER_TRANSPORT:-http}
+      PROMETHEUS_MCP_BIND_HOST: "0.0.0.0"
+      PROMETHEUS_MCP_BIND_PORT: ${PROMETHEUS_MCP_BIND_PORT:-8052}
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
