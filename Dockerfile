@@ -10,22 +10,14 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /prometheus-mcp-server ./cmd/prometheus-mcp-server
 
-FROM debian:bookworm-slim
+# Runtime uses Alpine (apk / Alpine CDN) so builds work when deb.debian.org is unreachable.
+FROM alpine:3.21
 
 WORKDIR /app
 
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends \
-        curl \
-        procps \
-        ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get clean && \
-    apt-get autoremove -y
-
-RUN groupadd -r -g 1000 app && \
-    useradd -r -g app -u 1000 -d /app -s /bin/false app && \
+RUN apk add --no-cache ca-certificates curl procps-ng && \
+    addgroup -g 1000 app && \
+    adduser -D -u 1000 -G app -h /app app && \
     chown -R app:app /app && \
     chmod 755 /app && \
     chmod -R go-w /app
@@ -57,7 +49,7 @@ LABEL org.opencontainers.image.title="Prometheus MCP Server" \
       org.opencontainers.image.url="https://github.com/pab1it0/prometheus-mcp-server" \
       org.opencontainers.image.documentation="https://github.com/pab1it0/prometheus-mcp-server/blob/main/docs/" \
       org.opencontainers.image.vendor="Pavel Shklovsky" \
-      org.opencontainers.image.base.name="debian:bookworm-slim" \
+      org.opencontainers.image.base.name="alpine:3.21" \
       org.opencontainers.image.created="" \
       org.opencontainers.image.revision="" \
       io.modelcontextprotocol.server.name="io.github.pab1it0/prometheus-mcp-server" \
