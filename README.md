@@ -233,30 +233,67 @@ Use a `TOOL_PREFIX` if you run multiple MCP server instances and need unique too
 
 ### Example prompts (plain English)
 
-In Cursor, Claude Desktop, or any MCP client, you describe intent in natural language; the assistant picks tools and fills arguments. Examples:
+In Cursor, Claude Desktop, or any MCP client you describe intent in natural language; the assistant maps it to tools and arguments. The tables below are **realistic SRE/operator phrasing** you can paste or paraphrase—tighten scope with environment, `job`, `cluster`, or `instance` when you talk to the model.
+
+**Connectivity, ad-hoc metrics, and discovery**
 
 | You might say | Tools the assistant will often use |
 | --- | --- |
-| “Is Prometheus / VictoriaMetrics reachable and can you run a simple query?” | `health_check`, maybe `execute_query` with `up` |
+| “Is Prometheus / VictoriaMetrics reachable and can you run a simple query?” | `health_check`, then `execute_query` on `up` or `vector(1)` |
+| “We’re in incident bridge—confirm the datasource responds before we trust numbers.” | `health_check`, `execute_query` |
 | “What’s the current value of `process_resident_memory_bytes` for `job="api"`?” | `execute_query` (instant PromQL/MetricsQL) |
-| “Plot request rate over the last 24 hours with a 5-minute step.” | `execute_range_query` with `query`, `start`, `end`, `step` |
-| “List metrics whose names look like `http`.” | `list_metrics` with `filter_pattern`, or `metrics` / `label_values` on `__name__` |
-| “What label names exist for series matching `{job="node"}`?” | `labels` with optional `match` |
-| “What are the values of the `instance` label for `up`?” | `label_values` with `label_name`: `instance`, `match`: `up` |
-| “Show me series that match `{__name__=~"container_.*"}`.” | `series` with `match` (and optional `start` / `end` / `limit`) |
-| “What metadata do we have for `node_cpu_seconds_total`?” | `get_metric_metadata` |
-| “Which scrape targets are up or down?” | `get_targets`, often plus `execute_query` on `up` |
-| “What rules and alerts are defined? Anything firing?” | `rules`, `alerts` (e.g. filter `state`: `firing`) |
-| “How heavy is cardinality / what dominates TSDB?” | `tsdb_status` (VictoriaMetrics / newer Prometheus) |
-| “What queries are slow or most frequent?” | `top_queries`, `active_queries`, `metric_statistics` (where supported) |
-| “Pretty-print this query: `sum(rate(http_requests_total[5m])) by (job)`” | `prettify_query`, sometimes `explain_query` |
-| “Give me doc links for MetricsQL vs Prometheus HTTP API.” | `documentation` |
-| “Export raw samples for `{job="prometheus"}` as JSON lines.” | `export` with `match`, `format`: `json` or `csv` |
-| “Which hosts hit **≥80% CPU** or **≥80% memory used** in the **last 24 hours**? Show peaks.” | `operator_host_resource_report` with `lookback`: `24h`, thresholds optional |
-| “Who pegged **disk** or had **network errors / high traffic**?” | Same tool with `include_disk_io` / `include_network`, or `include_all_standard_metrics`: true; optional `network_total_mbps_threshold` (Linux) or `windows_network_total_mbps_threshold` / `network_total_mbps_threshold` (Windows) for peak RX+TX Mbps |
-| “Which **process groups** (process-exporter) used the most **CPU / RSS** or have **zombies / FD pressure**?” | `operator_process_exporter_report` with `label_selector` for the exporter job, `include_all`: true or individual `include_*` flags |
+| “Graph error rate for `job="checkout"` for the last 6 hours, 1m step.” | `execute_range_query` with `query`, `start`, `end`, `step` |
+| “List metric names containing `grpc` or `http`.” | `list_metrics` / `metrics` / `label_values` on `__name__` |
+| “What labels exist on series for `{job="node-exporter"}`?” | `labels` with `match` |
+| “Give me all `instance` values where `up{job="blackbox"}` is 0.” | `label_values` or `execute_query` / `series` |
+| “Show series matching `{__name__=~"kube_pod_.*", namespace="prod"}`.” | `series` with `match`, `limit` |
+| “What type and help text does `node_cpu_seconds_total` have?” | `get_metric_metadata` |
+| “Pretty-print this hand-written query so I can paste it into Grafana.” | `prettify_query`, sometimes `explain_query` |
+| “Link me to MetricsQL / Prometheus HTTP API docs.” | `documentation` |
 
-If you set `TOOL_PREFIX`, the same flows apply but tool names become e.g. `prod_execute_query` instead of `execute_query`.
+**Incidents, alerts, and scrape health**
+
+| You might say | Tools the assistant will often use |
+| --- | --- |
+| “What’s firing right now? Group by severity if you can.” | `alerts` (`state`: `firing`), optionally `rules` |
+| “Show me alerting rules for the `kubernetes` group—anything newly added?” | `rules` with filters if supported |
+| “Which scrape targets are down or last error was not empty?” | `get_targets`, `execute_query` on `up`, scrape duration/errors if exported |
+| “Is vmalert healthy—any rule evaluation errors?” | `rules`, `alerts`, `execute_query` on vmalert metrics if present |
+| “After the config reload, did any target disappear from service discovery?” | `get_targets`, `series` with a tight `match` |
+
+**Host saturation (Linux / Windows) — curated runbook**
+
+| You might say | Tools the assistant will often use |
+| --- | --- |
+| “Which Linux nodes went over **80% CPU or memory** in the **last 24h**? I need a list for the handoff.” | `operator_host_resource_report`, `lookback` `24h`, `metric_profile` `node_exporter` or `auto`, `label_selector` for your node job |
+| “Latency spiked on DB tier—show nodes in **`env=prod`** that pegged CPU, disk, or network in the **last 6 hours**.” | `operator_host_resource_report`, `include_all_standard_metrics` or disk+network flags, narrow `label_selector` |
+| “Any boxes hitting **swap hard**, **high iowait**, or **PSI** stalls over the incident window?” | Same tool with `include_all_standard_metrics` or `include_swap`, `include_cpu_iowait`, `include_psi` |
+| “Did we exhaust **inodes**, **conntrack**, or **file descriptors** anywhere?” | Same tool: `include_filesystem_inodes`, `include_conntrack`, `include_file_descriptors` (or `include_all_standard_metrics`) |
+| “TCP weirdness—**retrans**, **listen drops**, **softnet drops**, high **time-wait**?” | Same tool: retrans, listen drops, softnet, socket stats flags |
+| “**Windows** fleet: who filled disks, saturated **physical disk**, or blew **network** errors?” | `operator_host_resource_report`, `metric_profile` `windows_exporter`, disk + network + optional `windows_nic_exclude_regex` |
+| “Windows SQL boxes—peak **logical disk throughput** and **link utilization %**, not just space.” | Same tool: `include_windows_logical_disk_throughput`, `include_network_link_percent` (often via `include_all_standard_metrics`) |
+| “Give me **top 10 healthiest** nodes under CPU threshold for comparison.” | `operator_host_resource_report`, `include_healthy_top_n` |
+
+**Process groups (process-exporter) vs host**
+
+| You might say | Tools the assistant will often use |
+| --- | --- |
+| “Node is hot—**which named process group** (Java, postgres, redis) is eating CPU?” | `operator_process_exporter_report`, `include_cpu_per_group` or `include_all`, `label_selector` for process-exporter job |
+| “Suspect a leak—who grew **RSS** or **open FD ratio** in the last **12h**?” | `operator_process_exporter_report`, `include_memory_rss`, `include_worst_fd_ratio`, set byte/ratio thresholds |
+| “Any **zombie** pile-up or **too many procs** in one group?” | Same tool: `include_zombie_procs`, `include_num_procs` |
+| “Is **process-exporter** itself failing scrapes—partial proc read errors?” | Same tool: `include_scrape_health` |
+| “Correlate: host-level saturation **and** top process groups for **`instance=10.0.0.5:9100`**.” | `operator_host_resource_report` + `operator_process_exporter_report` (align `instance` / labels in chat) |
+
+**Capacity, performance, and evidence**
+
+| You might say | Tools the assistant will often use |
+| --- | --- |
+| “What’s blowing up **cardinality**—top series counts by label?” | `tsdb_status` (where available) |
+| “What are the **slowest / hottest** queries hitting the cluster?” | `top_queries`, `active_queries`, `metric_statistics` (backend-dependent) |
+| “Export raw samples for **`{job="ingress"}`** between these timestamps for the postmortem.” | `export` with `match`, `format`, window |
+| “We’re on Victoria—any **metric relabel** or **retention** debug endpoints I should hit?” | `metric_relabel_debug`, `retention_filters_debug`, `downsampling_filters_debug` (if exposed) |
+
+If you set **`TOOL_PREFIX`**, the same flows apply but tool names become e.g. `prod_execute_query` instead of `execute_query`.
 
 ### Example tool arguments (reference)
 
