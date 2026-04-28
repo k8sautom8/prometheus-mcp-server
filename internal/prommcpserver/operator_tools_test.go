@@ -170,4 +170,7 @@ func TestOperatorHostResourceReportWindowsDiskNetwork(t *testing.T) {
 	if !strings.Contains(pqn, "windows_net_packets_received_errors_total") {
 		t.Fatalf("net errors promql: %s", pqn)
 	}
+	if !strings.Contains(pqn, `nic!~"isatap.*|VPN.*"`) {
+		t.Fatalf("expected default windows NIC exclude in promql: %s", pqn)
+	}
 }

@@ -216,7 +216,8 @@ Core tools match the original Prometheus MCP server. Additional tools mirror **[
 | `metric_relabel_debug` | Debug | `/metric-relabel-debug` (VictoriaMetrics) |
 | `retention_filters_debug` | Debug | `/retention-filters-debug` |
 | `downsampling_filters_debug` | Debug | `/downsampling-filters-debug` |
-| `operator_host_resource_report` | Operations | **Curated runbook:** peak **CPU** / **memory** / optional **filesystem** (space + Linux inode %), **disk I/O busy %** (Linux `node_disk_*`, Windows `windows_physical_disk_*`), **network** errors/drops + Mbps (`node_network_*` / `windows_net_*`). Linux extras: **load/core**, **PSI**, **file descriptors %**, **conntrack %**, **TCP retrans/sec**, **softnet drops/sec**. Set **`include_all_standard_metrics`** to turn on every optional block for the detected profile. **K8s cluster objects** need other scrapes—see below. |
+| `operator_host_resource_report` | Operations | **SRE runbook:** CPU, memory, filesystem (space + Linux inode %), disk busy %, network errors + throughput. **Linux:** load/core, PSI, **swap %**, **CPU iowait %**, **disk read/write MB/s**, **TCP listen drops**, **time-wait / established** peaks, filefd, conntrack, retrans, softnet. **Windows:** physical + optional **logical-disk** throughput, **NIC exclude** (default isatap/VPN), optional **link utilization %** vs `windows_net_current_bandwidth_bytes`. **`include_all_standard_metrics`** enables all optional blocks. **K8s objects** need other scrapes—see below. |
+| `operator_process_exporter_report` | Operations | **Linux:** [process-exporter](https://github.com/ncabatoff/process-exporter) `namedprocess_namegroup_*` — peak **CPU per group** (~cores), **RSS**, **num_procs**, **worst FD ratio**, **zombie** thread counts, **scrape** error rates. Use **`label_selector`** (e.g. `job="process-exporter"`). **`include_all`** turns on every block. Complements host-level `operator_host_resource_report`. |
 
 Some endpoints are VictoriaMetrics-specific or Enterprise-only; callers may receive HTTP errors on plain Prometheus.
 
@@ -224,7 +225,9 @@ Some endpoints are VictoriaMetrics-specific or Enterprise-only; callers may rece
 
 **Kubernetes + node_exporter:** metrics from the **node exporter DaemonSet** describe the **node’s Linux** (CPU, memory, disks, NICs on that VM/bare metal). They do **not** replace **kube-state-metrics** (object state: pod phase, deployment replicas, PVC bound), **cAdvisor/kubelet** (container CPU/mem throttle, OOM), or **API-server / etcd** health. Point the MCP at the same VictoriaMetrics where you already store those series, and use **`execute_query`** (or add more curated tools later) for `kube_*`, `container_*`, etc.
 
-**Possible extensions** (not all implemented): **RAID / SMART** if you export them; **predict_linear** on free space for “full in N days”; **goldilocks**-style right-sizing from container requests vs usage; NIC **utilization %** on Windows via `windows_net_current_bandwidth_bytes` in custom PromQL.
+**process-exporter:** **`operator_process_exporter_report`** is for **application/process groups** you configure in process-exporter (not every host will have series). Use it together with **`operator_host_resource_report`** when triaging “which JVM/pg/redis group is eating the node.”
+
+**Possible extensions** (not all implemented): **RAID / SMART** if you export them; **predict_linear** on free space for “full in N days”; **goldilocks**-style right-sizing from container requests vs usage.
 
 Use a `TOOL_PREFIX` if you run multiple MCP server instances and need unique tool names per environment.
 
@@ -251,14 +254,15 @@ In Cursor, Claude Desktop, or any MCP client, you describe intent in natural lan
 | “Export raw samples for `{job="prometheus"}` as JSON lines.” | `export` with `match`, `format`: `json` or `csv` |
 | “Which hosts hit **≥80% CPU** or **≥80% memory used** in the **last 24 hours**? Show peaks.” | `operator_host_resource_report` with `lookback`: `24h`, thresholds optional |
 | “Who pegged **disk** or had **network errors / high traffic**?” | Same tool with `include_disk_io` / `include_network`, or `include_all_standard_metrics`: true; optional `network_total_mbps_threshold` (Linux) or `windows_network_total_mbps_threshold` / `network_total_mbps_threshold` (Windows) for peak RX+TX Mbps |
+| “Which **process groups** (process-exporter) used the most **CPU / RSS** or have **zombies / FD pressure**?” | `operator_process_exporter_report` with `label_selector` for the exporter job, `include_all`: true or individual `include_*` flags |
 
 If you set `TOOL_PREFIX`, the same flows apply but tool names become e.g. `prod_execute_query` instead of `execute_query`.
 
 ### Example tool arguments (reference)
 
-Illustrative JSON for `tools/call` / debugging; your client normally builds this from chat.
+Illustrative JSON for `tools/call`, API debugging, or pasting into MCP inspector clients. Natural-language chat normally fills these for you. If you use **`TOOL_PREFIX`**, prefix every `name` (e.g. `prod_execute_query`).
 
-**Instant query**
+#### Instant and range queries
 
 ```json
 {
@@ -269,21 +273,19 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
 }
 ```
 
-**Range query**
-
 ```json
 {
   "name": "execute_range_query",
   "arguments": {
     "query": "up",
-    "start": "2025-04-26T00:00:00Z",
-    "end": "2025-04-27T00:00:00Z",
+    "start": "2026-04-26T00:00:00Z",
+    "end": "2026-04-27T00:00:00Z",
     "step": "5m"
   }
 }
 ```
 
-**Series and labels**
+#### Discovery: series and labels
 
 ```json
 {
@@ -305,7 +307,7 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
 }
 ```
 
-**Alerts and rules**
+#### Alerts and rules
 
 ```json
 {
@@ -326,7 +328,7 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
 }
 ```
 
-**Operations (VictoriaMetrics-friendly)**
+#### Operations (VictoriaMetrics-friendly)
 
 ```json
 {
@@ -348,7 +350,7 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
 }
 ```
 
-**Query helpers**
+#### Query helpers
 
 ```json
 {
@@ -359,30 +361,161 @@ Illustrative JSON for `tools/call` / debugging; your client normally builds this
 }
 ```
 
-**Operator breach report (node_exporter example)**
+---
+
+#### `operator_host_resource_report` — response shape (what to expect)
+
+The tool returns JSON with **`metric_profile_used`** (`node_exporter` or `windows_exporter`), embedded **PromQL** strings (e.g. `promql_cpu_peak_percent`), **`*_breaches`** arrays (hosts or groups that crossed thresholds during the lookback), **`*_peak_by_instance`** (or by mount/volume) for ranking, and **`caveats`**. Optional blocks appear only when enabled (directly or via **`include_all_standard_metrics`**).
+
+| Argument | Role |
+| --- | --- |
+| `lookback` | Window for `max_over_time` subqueries (e.g. `3h`, `24h`) |
+| `subquery_step` | Resolution inside subquery (default `5m`) |
+| `rate_window` | Inner `rate()` / `irate()` window (default `5m`) |
+| `label_selector` | Extra matchers **without** outer braces, comma-separated, e.g. `job="node-exporter",env="prod"` |
+| `metric_profile` | `auto` (probe metrics), `node_exporter`, or `windows_exporter` |
+| `include_all_standard_metrics` | If `true`, enables every optional signal for the detected OS; when `false`, turn blocks on individually with `include_*` |
+
+**Linux — minimal (CPU + memory only)**
 
 ```json
 {
   "name": "operator_host_resource_report",
   "arguments": {
     "lookback": "24h",
-    "cpu_percent_threshold": 80,
-    "memory_percent_threshold": 80,
-    "metric_profile": "auto",
+    "metric_profile": "node_exporter",
     "label_selector": "job=\"node-exporter\"",
-    "include_filesystem": true,
-    "filesystem_used_percent_threshold": 85,
-    "include_disk_io": true,
-    "disk_percent_threshold": 80,
-    "include_network": true,
-    "network_errors_per_sec_threshold": 1,
-    "network_total_mbps_threshold": 900,
-    "include_all_standard_metrics": false
+    "cpu_percent_threshold": 80,
+    "memory_percent_threshold": 80
   }
 }
 ```
 
-`network_total_mbps_threshold` is optional; when set, `network_throughput_breaches` lists hosts whose **peak** combined RX+TX exceeded that value (Linux sums non-loopback interfaces; Windows sums `windows_net_*` per host). It is **not** NIC utilization % unless you add link-speed normalization in custom PromQL.
+**Linux — full standard signals (recommended for on-call)**
+
+Single flag turns on filesystem, disk busy %, network errors + Mbps, load/core, PSI, inodes, file descriptors, conntrack, TCP retrans, softnet, swap, CPU iowait, disk throughput (MB/s), TCP listen drops, socket stats, etc.
+
+```json
+{
+  "name": "operator_host_resource_report",
+  "arguments": {
+    "lookback": "6h",
+    "metric_profile": "node_exporter",
+    "label_selector": "job=\"node-exporter\"",
+    "cpu_percent_threshold": 85,
+    "memory_percent_threshold": 85,
+    "include_all_standard_metrics": true,
+    "filesystem_used_percent_threshold": 85,
+    "disk_percent_threshold": 80,
+    "network_errors_per_sec_threshold": 1,
+    "network_total_mbps_threshold": 900,
+    "load_per_core_threshold": 1.2,
+    "psi_stall_rate_threshold": 0.3,
+    "swap_used_percent_threshold": 50,
+    "cpu_iowait_percent_threshold": 35,
+    "disk_read_megabytes_per_sec_threshold": 400,
+    "disk_write_megabytes_per_sec_threshold": 400,
+    "tcp_listen_drops_per_sec_threshold": 0.1,
+    "tcp_time_wait_high_threshold": 200000,
+    "tcp_established_high_threshold": 50000
+  }
+}
+```
+
+Omit optional `*_threshold` keys you do not need; breaches for disk MB/s and TCP established/time-wait only appear when those thresholds are set.
+
+**Linux — VictoriaMetrics / federation (`origin_prometheus` or extra labels)**
+
+```json
+{
+  "name": "operator_host_resource_report",
+  "arguments": {
+    "lookback": "3h",
+    "metric_profile": "node_exporter",
+    "label_selector": "job=\"node\",origin_prometheus=\"eu-1\"",
+    "include_all_standard_metrics": true
+  }
+}
+```
+
+**Windows — host saturation + logical disk + network**
+
+```json
+{
+  "name": "operator_host_resource_report",
+  "arguments": {
+    "lookback": "24h",
+    "metric_profile": "windows_exporter",
+    "label_selector": "job=\"windows_exporter\"",
+    "cpu_percent_threshold": 80,
+    "memory_percent_threshold": 80,
+    "include_all_standard_metrics": true,
+    "windows_network_total_mbps_threshold": 800,
+    "windows_logical_disk_total_mbps_threshold": 500,
+    "windows_nic_exclude_regex": "isatap.*|VPN.*"
+  }
+}
+```
+
+Set **`windows_nic_exclude_regex`** to `""` to include all interfaces (default when omitted is still `isatap.*|VPN.*`). **`include_network_link_percent`** (on by default with `include_all_standard_metrics`) adds peak **link utilization %** vs `windows_net_current_bandwidth_bytes`.
+
+**Windows — auto-detect profile**
+
+```json
+{
+  "name": "operator_host_resource_report",
+  "arguments": {
+    "lookback": "12h",
+    "metric_profile": "auto",
+    "label_selector": "env=\"prod\"",
+    "include_disk_io": true,
+    "include_network": true
+  }
+}
+```
+
+**`network_total_mbps_threshold`** (Linux) and **`windows_network_total_mbps_threshold`** / **`network_total_mbps_threshold`** (Windows) are optional: when set, throughput breach lists use **peak** RX+TX Mbps over the lookback. That is **not** the same as NIC **utilization %**; use **`include_network_link_percent`** on Windows for utilization-style alerting when bandwidth metrics exist.
+
+---
+
+#### `operator_process_exporter_report` — process groups (Linux)
+
+Requires **`namedprocess_namegroup_*`** series. Use **`label_selector`** to match the scrape job (and any other labels). If the probe finds no data, the tool returns **`error`** + **`hint`** instead of failing the MCP call.
+
+**Full report (all blocks)**
+
+```json
+{
+  "name": "operator_process_exporter_report",
+  "arguments": {
+    "lookback": "6h",
+    "label_selector": "job=\"process-exporter\"",
+    "include_all": true,
+    "cpu_seconds_per_sec_threshold": 2,
+    "memory_rss_bytes_threshold": 8589934592,
+    "num_procs_high_threshold": 500,
+    "worst_fd_ratio_threshold": 0.85,
+    "zombie_count_high_threshold": 1,
+    "scrape_errors_per_sec_threshold": 0.01
+  }
+}
+```
+
+**CPU-focused (cheap query set)**
+
+```json
+{
+  "name": "operator_process_exporter_report",
+  "arguments": {
+    "lookback": "3h",
+    "label_selector": "job=\"process-exporter\",cluster=\"prod\"",
+    "include_cpu_per_group": true,
+    "cpu_seconds_per_sec_threshold": 1.5
+  }
+}
+```
+
+**Peak CPU** is approximately **cores** used by each `groupname` on each `instance`. **RSS** / **num_procs** breaches only appear when you set the corresponding **`*_threshold`** fields.
 
 ## Features
 

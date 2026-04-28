@@ -16,11 +16,12 @@ import (
 func (d *Deps) registerOperatorTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: d.Cfg.ToolName("operator_host_resource_report"),
-		Description: "Operations runbook: CPU, memory, filesystem (Linux + Windows), optional Linux node_exporter extras (load/core, PSI, inode %, file descriptors %, conntrack %, TCP retrans/sec, softnet drops/sec, disk I/O busy %, network), " +
-			"and Windows extras (logical disk space, physical disk I/O busy %, network errors + throughput). Set include_all_standard_metrics=true to enable all optional blocks. VictoriaMetrics-compatible PromQL.",
+		Description: "SRE/ops runbook: CPU, memory, filesystem (Linux + Windows), disk busy %, network errors + throughput, optional Linux extras (load/core, PSI, swap %, CPU iowait %, inode/filefd/conntrack, TCP retrans/listen drops/socket gauges, softnet, disk MB/s), " +
+			"Windows extras (logical disk space + optional logical-disk throughput, physical disk busy %, network with default isatap/VPN NIC exclude, optional link utilization % vs windows_net_current_bandwidth_bytes). Set include_all_standard_metrics=true for all optional blocks. VictoriaMetrics-compatible PromQL.",
 		Title:       "Operator host saturation report",
 		Annotations: toolAnnotations("Operator host saturation report"),
 	}, d.operatorHostResourceReport)
+	d.registerOperatorProcessExporterTools(s)
 }
 
 type operatorHostResourceReportIn struct {
@@ -67,6 +68,37 @@ type operatorHostResourceReportIn struct {
 
 	// Windows network throughput breach (optional); errors use network_errors_per_sec_threshold.
 	WindowsNetworkTotalMbpsThreshold *float64 `json:"windows_network_total_mbps_threshold,omitempty"`
+
+	// Windows: regex for nic!~ (RE2). Nil → default isatap.*|VPN.*; empty string disables exclusion (sum all interfaces).
+	WindowsNicExcludeRegex *string `json:"windows_nic_exclude_regex,omitempty"`
+
+	// Windows: peak link utilization % = rate(bytes)*8 / windows_net_current_bandwidth_bytes * 100 (worst NIC per host).
+	IncludeNetworkLinkPercent            *bool    `json:"include_network_link_percent,omitempty"`
+	NetworkLinkPercentThreshold          *float64 `json:"network_link_percent_threshold,omitempty"`            // default 90
+	WindowsLogicalDiskTotalMbpsThreshold *float64 `json:"windows_logical_disk_total_mbps_threshold,omitempty"` // breach on peak read+write per volume
+
+	// Linux: swap space used % (SwapTotal − SwapFree).
+	IncludeSwap              *bool    `json:"include_swap,omitempty"`
+	SwapUsedPercentThreshold *float64 `json:"swap_used_percent_threshold,omitempty"` // default 80
+
+	// Linux: CPU time in iowait mode (%) — disk wait visible to scheduler.
+	IncludeCPUIOWait          *bool    `json:"include_cpu_iowait,omitempty"`
+	CPUIOWaitPercentThreshold *float64 `json:"cpu_iowait_percent_threshold,omitempty"` // default 40
+
+	// Linux: per-host peak disk read/write throughput (MB/s, bytes/1e6), max over devices.
+	IncludeDiskThroughput  *bool    `json:"include_disk_throughput,omitempty"`
+	DiskReadMBpsThreshold  *float64 `json:"disk_read_megabytes_per_sec_threshold,omitempty"`
+	DiskWriteMBpsThreshold *float64 `json:"disk_write_megabytes_per_sec_threshold,omitempty"`
+
+	// Linux: TCP listen backlog drops (rate) and optional socket gauge thresholds.
+	IncludeTCPListenDrops         *bool    `json:"include_tcp_listen_drops,omitempty"`
+	TcpListenDropsPerSecThreshold *float64 `json:"tcp_listen_drops_per_sec_threshold,omitempty"` // default 0.1
+	IncludeTCPSocketStats         *bool    `json:"include_tcp_socket_stats,omitempty"`           // time-wait + established counts
+	TcpTimeWaitHighThreshold      *float64 `json:"tcp_time_wait_high_threshold,omitempty"`       // optional breach on peak TCP_tw
+	TcpEstablishedHighThreshold   *float64 `json:"tcp_established_high_threshold,omitempty"`     // optional breach on peak CurrEstab
+
+	// Windows: peak logical-disk read+write combined throughput (Mbps), max over volumes (excludes _Total).
+	IncludeWindowsLogicalDiskThroughput *bool `json:"include_windows_logical_disk_throughput,omitempty"`
 }
 
 func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequest, in operatorHostResourceReportIn) (*mcp.CallToolResult, any, error) {
@@ -143,6 +175,22 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 	if in.SoftnetDropsPerSecThreshold != nil {
 		softnetTh = *in.SoftnetDropsPerSecThreshold
 	}
+	linkPctTh := 90.0
+	if in.NetworkLinkPercentThreshold != nil {
+		linkPctTh = *in.NetworkLinkPercentThreshold
+	}
+	swapTh := 80.0
+	if in.SwapUsedPercentThreshold != nil {
+		swapTh = *in.SwapUsedPercentThreshold
+	}
+	iowaitTh := 40.0
+	if in.CPUIOWaitPercentThreshold != nil {
+		iowaitTh = *in.CPUIOWaitPercentThreshold
+	}
+	listenDropTh := 0.1
+	if in.TcpListenDropsPerSecThreshold != nil {
+		listenDropTh = *in.TcpListenDropsPerSecThreshold
+	}
 
 	allStd := ptrTrue(in.IncludeAllStandardMetrics)
 	incFS := ptrTrue(in.IncludeFilesystem) || allStd
@@ -155,45 +203,81 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 	incConn := ptrTrue(in.IncludeConntrack) || allStd
 	incRetrans := ptrTrue(in.IncludeTCPRetransmits) || allStd
 	incSoftnet := ptrTrue(in.IncludeSoftnetDrops) || allStd
+	incLinkPct := ptrTrue(in.IncludeNetworkLinkPercent) || allStd
+	incWinLogDisk := ptrTrue(in.IncludeWindowsLogicalDiskThroughput) || allStd
+	incSwap := ptrTrue(in.IncludeSwap) || allStd
+	incIOWait := ptrTrue(in.IncludeCPUIOWait) || allStd
+	incDiskTP := ptrTrue(in.IncludeDiskThroughput) || allStd
+	incListen := ptrTrue(in.IncludeTCPListenDrops) || allStd
+	incSock := ptrTrue(in.IncludeTCPSocketStats) || allStd
+
+	winNicEx := windowsNicExclude(in)
 
 	out := map[string]any{
-		"lookback":                            lookback,
-		"subquery_step":                       step,
-		"rate_window":                         rateWin,
-		"cpu_threshold_percent":               cpuTh,
-		"memory_threshold_percent":            memTh,
-		"label_selector":                      sel,
-		"metric_profile_requested":            profile,
-		"include_all_standard_metrics":        allStd,
-		"include_disk_io":                     ptrTrue(in.IncludeDiskIO),
-		"include_network":                     ptrTrue(in.IncludeNetwork),
-		"include_filesystem":                  ptrTrue(in.IncludeFilesystem),
-		"effective_include_filesystem":        incFS,
-		"effective_include_disk_io":           incDisk,
-		"effective_include_network":           incNet,
-		"effective_include_load_per_core":     incLoad,
-		"effective_include_psi":               incPSI,
-		"effective_include_filesystem_inodes": incInode,
-		"effective_include_file_descriptors":  incFD,
-		"effective_include_conntrack":         incConn,
-		"effective_include_tcp_retransmits":   incRetrans,
-		"effective_include_softnet_drops":     incSoftnet,
-		"disk_threshold_percent":              diskTh,
-		"filesystem_used_percent_threshold":   fsTh,
-		"network_errors_per_sec_threshold":    netErrTh,
-		"load_per_core_threshold":             loadPerCoreTh,
-		"psi_stall_rate_threshold":            psiTh,
-		"filesystem_inode_percent_threshold":  inodeTh,
-		"file_descriptor_percent_threshold":   fdTh,
-		"conntrack_percent_threshold":         connTh,
-		"tcp_retrans_per_sec_threshold":       retransTh,
-		"softnet_drops_per_sec_threshold":     softnetTh,
+		"lookback":                                          lookback,
+		"subquery_step":                                     step,
+		"rate_window":                                       rateWin,
+		"cpu_threshold_percent":                             cpuTh,
+		"memory_threshold_percent":                          memTh,
+		"label_selector":                                    sel,
+		"metric_profile_requested":                          profile,
+		"include_all_standard_metrics":                      allStd,
+		"include_disk_io":                                   ptrTrue(in.IncludeDiskIO),
+		"include_network":                                   ptrTrue(in.IncludeNetwork),
+		"include_filesystem":                                ptrTrue(in.IncludeFilesystem),
+		"effective_include_filesystem":                      incFS,
+		"effective_include_disk_io":                         incDisk,
+		"effective_include_network":                         incNet,
+		"effective_include_load_per_core":                   incLoad,
+		"effective_include_psi":                             incPSI,
+		"effective_include_filesystem_inodes":               incInode,
+		"effective_include_file_descriptors":                incFD,
+		"effective_include_conntrack":                       incConn,
+		"effective_include_tcp_retransmits":                 incRetrans,
+		"effective_include_softnet_drops":                   incSoftnet,
+		"effective_include_network_link_percent":            incLinkPct,
+		"effective_include_windows_logical_disk_throughput": incWinLogDisk,
+		"effective_include_swap":                            incSwap,
+		"effective_include_cpu_iowait":                      incIOWait,
+		"effective_include_disk_throughput":                 incDiskTP,
+		"effective_include_tcp_listen_drops":                incListen,
+		"effective_include_tcp_socket_stats":                incSock,
+		"windows_nic_exclude_regex_applied":                 winNicEx,
+		"network_link_percent_threshold":                    linkPctTh,
+		"swap_used_percent_threshold":                       swapTh,
+		"cpu_iowait_percent_threshold":                      iowaitTh,
+		"tcp_listen_drops_per_sec_threshold":                listenDropTh,
+		"disk_threshold_percent":                            diskTh,
+		"filesystem_used_percent_threshold":                 fsTh,
+		"network_errors_per_sec_threshold":                  netErrTh,
+		"load_per_core_threshold":                           loadPerCoreTh,
+		"psi_stall_rate_threshold":                          psiTh,
+		"filesystem_inode_percent_threshold":                inodeTh,
+		"file_descriptor_percent_threshold":                 fdTh,
+		"conntrack_percent_threshold":                       connTh,
+		"tcp_retrans_per_sec_threshold":                     retransTh,
+		"softnet_drops_per_sec_threshold":                   softnetTh,
 	}
 	if in.NetworkTotalMbpsThreshold != nil {
 		out["network_total_mbps_threshold"] = *in.NetworkTotalMbpsThreshold
 	}
 	if in.WindowsNetworkTotalMbpsThreshold != nil {
 		out["windows_network_total_mbps_threshold"] = *in.WindowsNetworkTotalMbpsThreshold
+	}
+	if in.WindowsLogicalDiskTotalMbpsThreshold != nil {
+		out["windows_logical_disk_total_mbps_threshold"] = *in.WindowsLogicalDiskTotalMbpsThreshold
+	}
+	if in.DiskReadMBpsThreshold != nil {
+		out["disk_read_megabytes_per_sec_threshold"] = *in.DiskReadMBpsThreshold
+	}
+	if in.DiskWriteMBpsThreshold != nil {
+		out["disk_write_megabytes_per_sec_threshold"] = *in.DiskWriteMBpsThreshold
+	}
+	if in.TcpTimeWaitHighThreshold != nil {
+		out["tcp_time_wait_high_threshold"] = *in.TcpTimeWaitHighThreshold
+	}
+	if in.TcpEstablishedHighThreshold != nil {
+		out["tcp_established_high_threshold"] = *in.TcpEstablishedHighThreshold
 	}
 
 	probes := map[string]bool{}
@@ -326,6 +410,20 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 		}
 	}
 
+	if incWinLogDisk && usedProfile == "windows_exporter" {
+		ldExpr := windowsLogicalDiskTotalMbpsPeakExpr(selComma, rateWin, lookback, step)
+		out["promql_windows_logical_disk_total_throughput_peak_mbps"] = ldExpr
+		ldSamples, errLD := d.promInstantVector(ldExpr)
+		if errLD != nil {
+			out["windows_logical_disk_throughput_error"] = errLD.Error()
+		} else {
+			out["windows_logical_disk_throughput_peak_by_instance"] = samplesToMapsNamed(ldSamples, "peak_mbps")
+			if in.WindowsLogicalDiskTotalMbpsThreshold != nil {
+				out["windows_logical_disk_throughput_breaches"] = filterBreachesNamed(ldSamples, *in.WindowsLogicalDiskTotalMbpsThreshold, "peak_mbps")
+			}
+		}
+	}
+
 	winMbpsTh := in.WindowsNetworkTotalMbpsThreshold
 	if winMbpsTh == nil {
 		winMbpsTh = in.NetworkTotalMbpsThreshold
@@ -354,8 +452,8 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 				out["network_throughput_breaches"] = filterBreachesNamed(mbpsSamples, *in.NetworkTotalMbpsThreshold, "peak_mbps")
 			}
 		}
-	} else if incNet && usedProfile == "windows_exporter" {
-		netErrExpr := windowsNetworkErrorsPeakExpr(selComma, rateWin, lookback, step)
+	} else if usedProfile == "windows_exporter" && incNet {
+		netErrExpr := windowsNetworkErrorsPeakExpr(selComma, rateWin, lookback, step, winNicEx)
 		out["promql_network_errors_peak_per_sec"] = netErrExpr
 		netErrSamples, errNE := d.promInstantVector(netErrExpr)
 		if errNE != nil {
@@ -365,7 +463,7 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 			out["network_errors_peak_by_instance"] = samplesToMapsNamed(netErrSamples, "peak_errors_per_sec")
 		}
 
-		mbpsExpr := windowsNetworkTotalMbpsPeakExpr(selComma, rateWin, lookback, step)
+		mbpsExpr := windowsNetworkTotalMbpsPeakExpr(selComma, rateWin, lookback, step, winNicEx)
 		out["promql_network_total_throughput_peak_mbps"] = mbpsExpr
 		mbpsSamples, errTP := d.promInstantVector(mbpsExpr)
 		if errTP != nil {
@@ -375,6 +473,17 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 			if winMbpsTh != nil {
 				out["network_throughput_breaches"] = filterBreachesNamed(mbpsSamples, *winMbpsTh, "peak_mbps")
 			}
+		}
+	}
+	if usedProfile == "windows_exporter" && incLinkPct {
+		linkExpr := windowsNetworkLinkPercentPeakExpr(selComma, rateWin, lookback, step, winNicEx)
+		out["promql_network_link_utilization_peak_percent"] = linkExpr
+		linkSamples, errL := d.promInstantVector(linkExpr)
+		if errL != nil {
+			out["network_link_utilization_error"] = errL.Error()
+		} else {
+			out["network_link_utilization_peak_by_instance"] = samplesToMaps(linkSamples)
+			out["network_link_utilization_breaches"] = filterBreaches(linkSamples, linkPctTh)
 		}
 	}
 
@@ -457,6 +566,87 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 				out["softnet_drops_peak_by_instance"] = samplesToMapsNamed(snSamples, "peak_drops_per_sec")
 			}
 		}
+		if incSwap {
+			swExpr := nodeSwapUsedPeakExpr(selComma, lookback, step)
+			out["promql_swap_used_peak_percent"] = swExpr
+			swSamples, errSw := d.promInstantVector(swExpr)
+			if errSw != nil {
+				out["swap_error"] = errSw.Error()
+			} else {
+				out["swap_breaches"] = filterBreaches(swSamples, swapTh)
+				out["swap_peak_by_instance"] = samplesToMaps(swSamples)
+			}
+		}
+		if incIOWait {
+			iwExpr := nodeCPUIOWaitPeakExpr(selComma, rateWin, lookback, step)
+			out["promql_cpu_iowait_peak_percent"] = iwExpr
+			iwSamples, errIw := d.promInstantVector(iwExpr)
+			if errIw != nil {
+				out["cpu_iowait_error"] = errIw.Error()
+			} else {
+				out["cpu_iowait_breaches"] = filterBreaches(iwSamples, iowaitTh)
+				out["cpu_iowait_peak_by_instance"] = samplesToMaps(iwSamples)
+			}
+		}
+		if incDiskTP {
+			rdExpr := nodeDiskReadMBpsPeakExpr(selComma, rateWin, lookback, step)
+			out["promql_disk_read_peak_megabytes_per_sec"] = rdExpr
+			rdSamples, errR := d.promInstantVector(rdExpr)
+			if errR != nil {
+				out["disk_read_throughput_error"] = errR.Error()
+			} else {
+				out["disk_read_throughput_peak_by_instance"] = samplesToMapsNamed(rdSamples, "peak_megabytes_per_sec")
+				if in.DiskReadMBpsThreshold != nil {
+					out["disk_read_throughput_breaches"] = filterBreachesNamed(rdSamples, *in.DiskReadMBpsThreshold, "peak_megabytes_per_sec")
+				}
+			}
+			wrExpr := nodeDiskWriteMBpsPeakExpr(selComma, rateWin, lookback, step)
+			out["promql_disk_write_peak_megabytes_per_sec"] = wrExpr
+			wrSamples, errW := d.promInstantVector(wrExpr)
+			if errW != nil {
+				out["disk_write_throughput_error"] = errW.Error()
+			} else {
+				out["disk_write_throughput_peak_by_instance"] = samplesToMapsNamed(wrSamples, "peak_megabytes_per_sec")
+				if in.DiskWriteMBpsThreshold != nil {
+					out["disk_write_throughput_breaches"] = filterBreachesNamed(wrSamples, *in.DiskWriteMBpsThreshold, "peak_megabytes_per_sec")
+				}
+			}
+		}
+		if incListen {
+			tldExpr := nodeTCPListenDropsPeakExpr(selComma, rateWin, lookback, step)
+			out["promql_tcp_listen_drops_peak_per_sec"] = tldExpr
+			tldSamples, errTld := d.promInstantVector(tldExpr)
+			if errTld != nil {
+				out["tcp_listen_drops_error"] = errTld.Error()
+			} else {
+				out["tcp_listen_drops_breaches"] = filterBreachesNamed(tldSamples, listenDropTh, "peak_listen_drops_per_sec")
+				out["tcp_listen_drops_peak_by_instance"] = samplesToMapsNamed(tldSamples, "peak_listen_drops_per_sec")
+			}
+		}
+		if incSock {
+			twExpr := nodeTCPTimewaitPeakExpr(selComma, lookback, step)
+			out["promql_tcp_time_wait_peak"] = twExpr
+			twSamples, errTw := d.promInstantVector(twExpr)
+			if errTw != nil {
+				out["tcp_time_wait_error"] = errTw.Error()
+			} else {
+				out["tcp_time_wait_peak_by_instance"] = samplesToMapsNamed(twSamples, "peak_tcp_time_wait")
+				if in.TcpTimeWaitHighThreshold != nil {
+					out["tcp_time_wait_breaches"] = filterBreachesNamed(twSamples, *in.TcpTimeWaitHighThreshold, "peak_tcp_time_wait")
+				}
+			}
+			estExpr := nodeTCPEstablishedPeakExpr(selComma, lookback, step)
+			out["promql_tcp_established_peak"] = estExpr
+			estSamples, errEs := d.promInstantVector(estExpr)
+			if errEs != nil {
+				out["tcp_established_error"] = errEs.Error()
+			} else {
+				out["tcp_established_peak_by_instance"] = samplesToMapsNamed(estSamples, "peak_tcp_established")
+				if in.TcpEstablishedHighThreshold != nil {
+					out["tcp_established_breaches"] = filterBreachesNamed(estSamples, *in.TcpEstablishedHighThreshold, "peak_tcp_established")
+				}
+			}
+		}
 	}
 
 	out["caveats"] = []string{
@@ -466,8 +656,10 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 		"Subqueries are expensive; keep lookback reasonable.",
 		"Linux disk busy % uses node_disk_io_time_seconds_total; Windows uses windows_physical_disk_idle_seconds_total (idle-time counter semantics from Perflib).",
 		"Windows logical disk free/size can lag 10–15 minutes per windows_exporter docs.",
-		"Network 'Mbps' is sum of RX+TX bytes rates × 8 / 1e6 (approximate link load), not utilization % unless you compare to NIC speed yourself.",
-		"PSI requires kernel support; file descriptor and conntrack metrics require the corresponding node_exporter collectors.",
+		"Network 'Mbps' uses bytes rate × 8 / 1e6. Windows NICs default-exclude pseudo interfaces (isatap/VPN); override with windows_nic_exclude_regex (empty string disables).",
+		"Windows link utilization % uses windows_net_current_bandwidth_bytes (verify name matches your windows_exporter version).",
+		"PSI requires kernel support; file descriptor, conntrack, and TcpExt collectors must be enabled in node_exporter where used.",
+		"TCP listen drops use node_netstat_TcpExt_ListenDrops; swap/iowait/disk MB/s thresholds are optional—set explicit limits for noisy environments.",
 	}
 
 	if in.IncludeHealthyTopN != nil && *in.IncludeHealthyTopN > 0 && len(cpuSamples) > 0 {
@@ -479,6 +671,28 @@ func (d *Deps) operatorHostResourceReport(_ context.Context, _ *mcp.CallToolRequ
 
 func ptrTrue(p *bool) bool {
 	return p != nil && *p
+}
+
+// windowsNicExclude: nil WindowsNicExcludeRegex → default StarsL/Grafana-style pseudo-NIC filter; "" disables.
+func windowsNicExclude(in operatorHostResourceReportIn) string {
+	if in.WindowsNicExcludeRegex != nil {
+		return *in.WindowsNicExcludeRegex
+	}
+	return `isatap.*|VPN.*`
+}
+
+func windowsNetLbl(selComma, nicExcludeRE string) string {
+	var parts []string
+	if s := strings.TrimPrefix(selComma, ","); s != "" {
+		parts = append(parts, s)
+	}
+	if nicExcludeRE != "" {
+		parts = append(parts, fmt.Sprintf(`nic!~%q`, nicExcludeRE))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 // nodeFilesystemUsedPeakExpr: peak used % per instance+mountpoint over lookback (excludes common pseudo filesystems).
@@ -684,39 +898,147 @@ func windowsDiskBusyPeakExpr(selComma, rateWin, lookback, step string) string {
 	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
 }
 
-func windowsNetworkErrorsPeakExpr(selComma, rateWin, lookback, step string) string {
+func windowsNetworkErrorsPeakExpr(selComma, rateWin, lookback, step, nicExcludeRE string) string {
+	lbl := windowsNetLbl(selComma, nicExcludeRE)
+	inner := fmt.Sprintf(`sum by (instance) (
+  rate(windows_net_packets_outbound_errors_total%s[%s]) +
+  rate(windows_net_packets_received_errors_total%s[%s]) +
+  rate(windows_net_packets_outbound_discarded_total%s[%s]) +
+  rate(windows_net_packets_received_discarded_total%s[%s])
+)`, lbl, rateWin, lbl, rateWin, lbl, rateWin, lbl, rateWin)
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func windowsNetworkTotalMbpsPeakExpr(selComma, rateWin, lookback, step, nicExcludeRE string) string {
+	lbl := windowsNetLbl(selComma, nicExcludeRE)
+	inner := fmt.Sprintf(`sum by (instance) (
+  rate(windows_net_bytes_received_total%s[%s]) +
+  rate(windows_net_bytes_sent_total%s[%s])
+) * 8 / 1e6`, lbl, rateWin, lbl, rateWin)
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func windowsNetworkLinkPercentPeakExpr(selComma, rateWin, lookback, step, nicExcludeRE string) string {
+	lbl := windowsNetLbl(selComma, nicExcludeRE)
+	inner := fmt.Sprintf(`max by (instance) (
+  max by (instance, nic) (
+    (rate(windows_net_bytes_total%s[%s]) * 8) / clamp_min(windows_net_current_bandwidth_bytes%s, 1) * 100
+  )
+)`, lbl, rateWin, lbl)
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func windowsLogicalDiskTotalMbpsPeakExpr(selComma, rateWin, lookback, step string) string {
+	vol := `volume!="_Total"`
 	var inner string
 	if selComma == "" {
-		inner = fmt.Sprintf(`sum by (instance) (
-  rate(windows_net_packets_outbound_errors_total[%[1]s]) +
-  rate(windows_net_packets_received_errors_total[%[1]s]) +
-  rate(windows_net_packets_outbound_discarded_total[%[1]s]) +
-  rate(windows_net_packets_received_discarded_total[%[1]s])
-)`, rateWin)
+		inner = fmt.Sprintf(`max by (instance) (
+  max by (instance, volume) (
+    (rate(windows_logical_disk_read_bytes_total{%[1]s}[%[2]s]) + rate(windows_logical_disk_write_bytes_total{%[1]s}[%[2]s])) * 8 / 1e6
+  )
+)`, vol, rateWin)
 	} else {
-		inner = fmt.Sprintf(`sum by (instance) (
-  rate(windows_net_packets_outbound_errors_total{%[1]s}[%[2]s]) +
-  rate(windows_net_packets_received_errors_total{%[1]s}[%[2]s]) +
-  rate(windows_net_packets_outbound_discarded_total{%[1]s}[%[2]s]) +
-  rate(windows_net_packets_received_discarded_total{%[1]s}[%[2]s])
-)`, strings.TrimPrefix(selComma, ","), rateWin)
+		s := strings.TrimPrefix(selComma, ",")
+		inner = fmt.Sprintf(`max by (instance) (
+  max by (instance, volume) (
+    (rate(windows_logical_disk_read_bytes_total{%[1]s,%[2]s}[%[3]s]) + rate(windows_logical_disk_write_bytes_total{%[1]s,%[2]s}[%[3]s])) * 8 / 1e6
+  )
+)`, vol, s, rateWin)
 	}
 	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
 }
 
-func windowsNetworkTotalMbpsPeakExpr(selComma, rateWin, lookback, step string) string {
+func nodeSwapUsedPeakExpr(selComma, lookback, step string) string {
 	var inner string
 	if selComma == "" {
-		inner = fmt.Sprintf(`sum by (instance) (
-  rate(windows_net_bytes_received_total[%[1]s]) +
-  rate(windows_net_bytes_sent_total[%[1]s])
-) * 8 / 1e6`, rateWin)
+		inner = `100 * (1 - ((node_memory_SwapFree_bytes + 1) / (node_memory_SwapTotal_bytes + 1)))`
 	} else {
 		s := strings.TrimPrefix(selComma, ",")
-		inner = fmt.Sprintf(`sum by (instance) (
-  rate(windows_net_bytes_received_total{%[1]s}[%[2]s]) +
-  rate(windows_net_bytes_sent_total{%[1]s}[%[2]s])
-) * 8 / 1e6`, s, rateWin)
+		inner = fmt.Sprintf(
+			`100 * (1 - ((node_memory_SwapFree_bytes{%[1]s} + 1) / (node_memory_SwapTotal_bytes{%[1]s} + 1)))`,
+			s,
+		)
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeCPUIOWaitPeakExpr(selComma, rateWin, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = fmt.Sprintf(
+			`100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[%s]))`,
+			rateWin,
+		)
+	} else {
+		inner = fmt.Sprintf(
+			`100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"%s}[%s]))`,
+			selComma, rateWin,
+		)
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeDiskReadMBpsPeakExpr(selComma, rateWin, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = fmt.Sprintf(
+			`max by (instance) (rate(node_disk_read_bytes_total{device!=""}[%s]) / 1e6)`,
+			rateWin,
+		)
+	} else {
+		inner = fmt.Sprintf(
+			`max by (instance) (rate(node_disk_read_bytes_total{device!=""%s}[%s]) / 1e6)`,
+			selComma, rateWin,
+		)
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeDiskWriteMBpsPeakExpr(selComma, rateWin, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = fmt.Sprintf(
+			`max by (instance) (rate(node_disk_written_bytes_total{device!=""}[%s]) / 1e6)`,
+			rateWin,
+		)
+	} else {
+		inner = fmt.Sprintf(
+			`max by (instance) (rate(node_disk_written_bytes_total{device!=""%s}[%s]) / 1e6)`,
+			selComma, rateWin,
+		)
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeTCPListenDropsPeakExpr(selComma, rateWin, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = fmt.Sprintf(`sum by (instance) (rate(node_netstat_TcpExt_ListenDrops[%s]))`, rateWin)
+	} else {
+		inner = fmt.Sprintf(
+			`sum by (instance) (rate(node_netstat_TcpExt_ListenDrops{%s}[%s]))`,
+			strings.TrimPrefix(selComma, ","), rateWin,
+		)
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeTCPTimewaitPeakExpr(selComma, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = `node_sockstat_TCP_tw`
+	} else {
+		inner = fmt.Sprintf(`node_sockstat_TCP_tw{%s}`, strings.TrimPrefix(selComma, ","))
+	}
+	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
+}
+
+func nodeTCPEstablishedPeakExpr(selComma, lookback, step string) string {
+	var inner string
+	if selComma == "" {
+		inner = `node_netstat_Tcp_CurrEstab`
+	} else {
+		inner = fmt.Sprintf(`node_netstat_Tcp_CurrEstab{%s}`, strings.TrimPrefix(selComma, ","))
 	}
 	return fmt.Sprintf(`max_over_time((%s)[%s:%s])`, inner, lookback, step)
 }
