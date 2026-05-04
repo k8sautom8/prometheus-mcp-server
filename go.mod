@@ -3,7 +3,7 @@ module github.com/pab1it0/prometheus-mcp-server
 go 1.25.0
 
 require (
-	github.com/VictoriaMetrics/metricsql v0.86.0
+	github.com/VictoriaMetrics/metricsql v0.87.0
 	github.com/joho/godotenv v1.5.1
 	github.com/modelcontextprotocol/go-sdk v1.5.0
 )
